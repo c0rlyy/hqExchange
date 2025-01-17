@@ -8,6 +8,28 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type MessageHandler func(msg *Message, conn *websocket.Conn)
+
+var actionHandlers = map[byte]MessageHandler{
+	Subscribe: subscribeHandler,
+	Publish:   publishHandler,
+	Pop:       popHandler,
+	// Unsubscribe: unsubscribeHandler,
+	// Ping:        pingHandler,
+	// Pong:        pongHandler,
+	// Ack:         ackHandler,
+	// Nack:        nackHandler,
+	// Merror:      errorHandler,
+	AddTopic:  addTopicHandler,
+	GlobalSub: globalSubHandler,
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
 type Server struct {
 	Mb          MessageBroker
 	Connections Connections
@@ -51,7 +73,6 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 		}
 		handleMessage(msg, connection)
 	}
-
 }
 
 func handleMessage(msg *Message, conn *websocket.Conn) {

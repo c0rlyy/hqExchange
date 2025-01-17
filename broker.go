@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"slices"
@@ -24,16 +23,27 @@ type Subscribers = []*Subscriber
 // TODO maybe return pointer to que so you dont have to specify which que by topic every time
 type MessageBroker struct {
 	GlobalSubscribers []*Subscriber
-	Subscribers       map[Topic]Subscribers
 	mu                sync.RWMutex
-	Topics            map[Topic]Que
+	Topics            map[Topic]*TopicContext
+}
+
+type TopicContext struct {
+	mu          *sync.RWMutex
+	Subscribers []*Subscriber
+	Writer      *TopicWriter
+	Queue       Que
+	EventStream chan EventNotification
+}
+
+type TopicWriter struct {
+	IsClosed bool
 }
 
 // subscriber for topics
 type Subscriber struct {
 	Id     string                 // maybe will use this sometime
 	Closed bool                   // need this for reall importnat reason im a moron
-	Ch     chan EventNotification // channel to send to notification
+	Chan   chan EventNotification // channel to send to notification
 	mu     *sync.RWMutex          // might be usless dont know yet, but could make mb lsightl faster if used correctly
 }
 
@@ -51,9 +61,9 @@ type MessageBrokerErr struct {
 
 func NewMessageBroker() *MessageBroker {
 	mb := &MessageBroker{
-		Subscribers:       make(map[Topic]Subscribers),
-		Topics:            make(map[Topic]Que),
+		Topics:            make(map[Topic]*TopicContext),
 		GlobalSubscribers: make([]*Subscriber, 0),
+		mu:                sync.RWMutex{},
 	}
 	return mb
 }
@@ -66,6 +76,77 @@ func NewMessageBrokerErr(msg, op, severity, context string) *MessageBrokerErr {
 		Context:  context,
 	}
 }
+
+func NewTopicContext() *TopicContext {
+	return &TopicContext{
+		Subscribers: make([]*Subscriber, 10),
+		Writer:      NewTopicWriter(),
+		EventStream: make(chan EventNotification, 100),
+		Queue:       make(Que, 10),
+	}
+}
+
+func NewTopicWriter() *TopicWriter {
+	return &TopicWriter{
+		// EventStream: make(chan []byte, 100),
+		IsClosed: false,
+	}
+}
+
+func (tc *TopicContext) writeEvent(event EventNotification) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.Queue = append(tc.Queue, event)
+}
+
+func (tc *TopicContext) NotifyAllSubs(event EventNotification) error {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	for _, sub := range tc.Subscribers {
+		if err := sub.SendToChan(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// starts go rutine that notifies all subscibers and writes events to Que
+func (tc *TopicContext) ProccessEvents() {
+	go func() {
+		event := <-tc.EventStream
+		tc.writeEvent(event)
+		tc.NotifyAllSubs(event)
+	}()
+}
+
+func (tc *TopicContext) SendEvent(event EventNotification) error {
+	select {
+	case tc.EventStream <- event:
+		return nil
+	default:
+		return NewMessageBrokerErr("closed", "", "", "")
+	}
+}
+
+// TODO finish this
+func (tc *TopicContext) CloseTopic() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for _, sub := range tc.Subscribers {
+		sub.Close()
+	}
+	tc.Queue = nil
+}
+
+func (tc *TopicContext) subscribe() *Subscriber {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	newSub := NewSubscriber()
+	tc.Subscribers = append(tc.Subscribers, newSub)
+	return newSub
+}
+
 func (e *MessageBrokerErr) Error() string {
 	return fmt.Sprintf("[%s] %s: %s, Context: %s", e.Severity, e.Op, e.Msg, e.Context)
 }
@@ -75,17 +156,25 @@ func NewSubscriber() *Subscriber {
 	return &Subscriber{
 		Id:     "",
 		Closed: false,
-		Ch:     make(chan EventNotification, 100),
+		Chan:   make(chan EventNotification, 100),
 		mu:     &sync.RWMutex{},
 	}
 }
 
 // TODO finish this
 func (s *Subscriber) SendToChan(e EventNotification) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.Closed {
-		return nil
+		return NewMessageBrokerErr("sending on closed channel", "", "critical", s.Id)
 	}
-	return nil
+
+	select {
+	case s.Chan <- e:
+		return nil
+	default:
+		return NewMessageBrokerErr("buffer full, message dropped", "", "warning", s.Id)
+	}
 }
 
 func (s *Subscriber) Close() {
@@ -93,9 +182,13 @@ func (s *Subscriber) Close() {
 	defer s.mu.Unlock()
 
 	if !s.Closed {
-		close(s.Ch)
+		close(s.Chan)
 		s.Closed = true
 	}
+}
+
+func (mb *MessageBroker) ProccessGlobalEvents() error {
+	return nil
 }
 
 // deiced to return error since it might be usfull if i want to check wheater the topic was created,
@@ -107,9 +200,11 @@ func (mb *MessageBroker) AddTopic(topic Topic) error {
 	if _, exists := mb.Topics[topic]; exists {
 		return NewMessageBrokerErr("topic already exits", "adding topic", "warrning", topic)
 	}
+	tContext := NewTopicContext()
+	//go rutine start
+	tContext.ProccessEvents()
 
-	mb.Topics[topic] = make(Que, 10)
-	mb.Subscribers[topic] = make(Subscribers, 0)
+	mb.Topics[topic] = tContext
 	return nil
 }
 
@@ -117,7 +212,8 @@ func (mb *MessageBroker) DeleteTopic(topic Topic) error {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
-	if _, ok := mb.Topics[topic]; !ok {
+	tContext, ok := mb.Topics[topic]
+	if !ok {
 		return &MessageBrokerErr{
 			Msg:      "topic was not found",
 			Op:       "deleting topic",
@@ -126,66 +222,27 @@ func (mb *MessageBroker) DeleteTopic(topic Topic) error {
 		}
 	}
 
+	tContext.CloseTopic()
 	delete(mb.Topics, topic)
-	for _, sub := range mb.Subscribers[topic] {
-		sub.Close()
-	}
-	delete(mb.Subscribers, topic)
-	return nil
-}
-
-// sending event to the every subsciuber in specified topic, safe to use
-func (mb *MessageBroker) Propagate(e EventNotification, topic Topic) error {
-	mb.mu.RLock()
-	defer mb.mu.RUnlock()
-
-	subs, ok := mb.Subscribers[topic]
-	if !ok {
-		return NewMessageBrokerErr("topic does not exist", "sending event", "critical", topic)
-	}
-
-	for _, sub := range subs {
-		closed := sub.Closed
-		if closed {
-			log.Printf("skipping closed subscriber for topic: %s", topic)
-			continue
-		}
-
-		go func(s *Subscriber) {
-			s.Ch <- e
-		}(sub)
-	}
 	return nil
 }
 
 // adds event to the queue for the specified topic.
 // if topics doest exits it errors out, made this way for more less unpredicted behavoir
 func (mb *MessageBroker) Publish(topic Topic, payload Data) error {
-	mb.mu.Lock()
-	defer mb.mu.Unlock()
-
-	_, exists := mb.Topics[topic]
+	tContext, exists := mb.Topics[topic]
 	if !exists {
 		return NewMessageBrokerErr("Topic does not exits", "pushing event", "critical", topic)
 	}
 
-	mb.Topics[topic] = append(mb.Topics[topic], payload)
-	subs, exists := mb.Subscribers[topic]
-	if !exists {
-		return NewMessageBrokerErr("channel for Topic does not exits", "pushing event", "critical", topic)
+	if err := tContext.SendEvent(payload); err != nil {
+		return err
 	}
 
-	// making this non blocking in case chan buff is full
-	for _, sub := range subs {
-		go func(sub *Subscriber) {
-			if sub.Closed {
-				log.Println("channel is closed")
-				return
-			}
-			message := payload
-			sub.Ch <- message
-		}(sub)
-	}
+	// glSub := mb.GlobalSubscribers
+	// for _, glSub := range glSub {
+	// 	glSub.SendToChan(payload)
+	// }
 	return nil
 }
 
@@ -225,55 +282,52 @@ func (mb *MessageBroker) PopMessage(topic Topic) error {
 
 // TODO ADD AN ERROR IF NOT FOUND
 // pops specific events from the queue for the specified topic, using comparison so event must == e from inside of events.
-func (mb *MessageBroker) DeleteEvents(topic Topic, data Data) {
-	mb.mu.Lock()
-	defer mb.mu.Unlock()
-	deleteFn := func(e Data) bool {
-		return bytes.Equal(e, data)
-	}
-	mb.Topics[topic] = slices.DeleteFunc(mb.Topics[topic], deleteFn)
-}
+// func (mb *MessageBroker) DeleteEvents(topic Topic, data Data) {
+// 	mb.mu.Lock()
+// 	defer mb.mu.Unlock()
+// 	deleteFn := func(e Data) bool {
+// 		return bytes.Equal(e, data)
+// 	}
+// 	mb.Topics[topic] = slices.DeleteFunc(mb.Topics[topic], deleteFn)
+// }
 
 // returns all events from que
+
 func (mb *MessageBroker) GetEvents(topic Topic) (Que, error) {
 	mb.mu.RLock()
 	defer mb.mu.RUnlock()
 
-	que, ok := mb.Topics[topic]
+	tContext, ok := mb.Topics[topic]
 	if !ok {
 		return nil, NewMessageBrokerErr("topic does not exits", "getting events", "warrning", "")
 	}
-	return que, nil
+	return tContext.Queue, nil
 }
 
 // gets first event found in the que mathcing the event passed in
-func (mb *MessageBroker) GetEvent(topic Topic, data Data) (Data, error) {
-	mb.mu.RLock()
-	defer mb.mu.RUnlock()
+// func (mb *MessageBroker) GetEvent(topic Topic, data Data) (Data, error) {
+// 	mb.mu.RLock()
+// 	defer mb.mu.RUnlock()
 
-	for _, val := range mb.Topics[topic] {
-		if slices.Equal(data, val) {
-			return val, nil
-		}
-	}
-	return nil, NewMessageBrokerErr("no event was found in que", "get event", "warning", topic)
-}
+// 	for _, val := range mb.Topics[topic] {
+// 		if slices.Equal(data, val) {
+// 			return val, nil
+// 		}
+// 	}
+// 	return nil, NewMessageBrokerErr("no event was found in que", "get event", "warning", topic)
+// }
 
 // creating new subscriber everytime this fn is executed that allows for lisinging to events coming in
 func (mb *MessageBroker) SubscribeTopic(topic Topic) (*Subscriber, error) {
-	mb.mu.Lock()
-	defer mb.mu.Unlock()
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
 
-	if _, ok := mb.Topics[topic]; !ok {
+	tContext, ok := mb.Topics[topic]
+	if !ok {
 		return nil, NewMessageBrokerErr("topic was not found", "subscribing to topic", "critical", topic)
 	}
 
-	newSub := NewSubscriber()
-	if _, ok := mb.Subscribers[topic]; !ok {
-		mb.Subscribers[topic] = make(Subscribers, 0)
-	}
-
-	mb.Subscribers[topic] = append(mb.Subscribers[topic], newSub)
+	newSub := tContext.subscribe()
 	return newSub, nil
 }
 
