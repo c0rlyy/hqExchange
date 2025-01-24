@@ -1,7 +1,9 @@
-TAK POTRZEBUJE BO NIE KAZDY KLIENT BEDZIE MIAL DOSTEP DO WYSZTKICH EFVFENTOW, DODAJ ZE PUBLISH DODAJE DO GLOBBAL SUBS
 1. Make errors better right now they are not usable from client add topic from, and detailed data
 2. add ping and pong
 3. think bout reconnecting 
 4. Maybe change the structure of current message
 coz it doesnt make sense to have payload adta in a subscrition or adding tropic
 5. maybe add ack and nack
+6. Fix the notify make it a go rutine
+7. Make a function that creates go rutines that notify every sub seperatyl bout
+use wait group

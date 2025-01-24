@@ -52,13 +52,13 @@ func subscribeHandler(message *Message, connection *websocket.Conn) {
 
 	// lisineng for incoming messages and sendim them back to client
 	go func(sub *Subscriber) {
-		defer sub.Close()
+		defer sub.close()
 		for {
 			if sub.Closed {
 				log.Println("Channel Was closed")
 				return
 			}
-			message := <-sub.Chan
+			message := <-sub.Ch
 			if err := connection.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				log.Println("Conneciton errro closing the channel")
 				// sub.Close()
@@ -96,7 +96,7 @@ func popHandler(msg *Message, conn *websocket.Conn) {
 		errorBackClient(errMsg, conn)
 		return
 	}
-	if err := Mb.PopMessage(topic); err != nil {
+	if err := Mb.Pop(topic); err != nil {
 		log.Printf("error %v", err)
 		errMsg := NewAutoLengthMessage(Merror, make(map[string]string), fmt.Sprintf("error in topic %v:%v", topic, err))
 		errorBackClient(errMsg, conn)
@@ -106,22 +106,23 @@ func popHandler(msg *Message, conn *websocket.Conn) {
 
 func globalSubHandler(msg *Message, conn *websocket.Conn) {
 	log.Println("recived global subsciber action")
-	sub, err := Mb.SubscribeGlobal()
+	sub, err := Mb.GlobalSubscribe()
 	if err != nil {
 		errMsg := NewAutoLengthMessage(Merror, make(map[string]string), fmt.Sprintf("error while global sub is: %v", err))
 		errorBackClient(errMsg, conn)
 		return
 	}
+	// every client subs on new go rutine
 	go func(sub *Subscriber) {
 		for {
 			if sub.Closed {
 				log.Println("Channel Was closed")
 				return
 			}
-			message := <-sub.Chan
+			message := <-sub.Ch
 			if err := conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				log.Println("Conneciton errro closing the channel")
-				sub.Close()
+				sub.close()
 				return
 			}
 		}
